@@ -1,0 +1,20 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4018.5">
+  <DUT Name="FB_LaserScannerR2000_ScanParameter" Id="{52b15f26-ad73-4759-b6a5-7b5c051e01e1}">
+    <Declaration><![CDATA[TYPE FB_LaserScannerR2000_ScanParameter :
+STRUCT
+	//Ist die Variable TRUE dann dreht der Laser im Gegenuhrzeigersinn (CCW) ansonsten im Uhrzeigersinn
+	drehrichtungCCW : BOOL;
+	//Die Frequenz in Hz mit der der Laser rotieren soll. Zulässige Werte 10Hz bis 50Hz
+	messFrequenz : UINT;
+	//Der Winkel zwischen den einzelnen Messungen in Grad
+	messAufloesung : REAL;
+	//Der Winkel in Grad bei dem die Messung beginnen soll
+	startwinkel : INT;
+	//Der Winkel in Grad bei dem die Messung beendet werden soll
+	endWinkel : INT;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

@@ -1,0 +1,20 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4018.5">
+  <DUT Name="FB_httpClient_status" Id="{9479e6b4-b648-4c84-b878-c9ed889c68c2}">
+    <Declaration><![CDATA[TYPE FB_httpClient_status :
+STRUCT
+	//Wird TRUE wenn der Baustein arbeitet
+	busy : BOOL;
+	//Die erhaltene Antwort
+	antwort : STRING(255);
+	//Ein Fehler ist aufgetreten!
+	error : BOOL;
+	//ErrorID
+	errorId : UDINT;
+	//Error Meldung
+	errorMeldung : STRING(255);
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

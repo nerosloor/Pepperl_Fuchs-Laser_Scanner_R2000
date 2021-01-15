@@ -1,0 +1,14 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4018.5">
+  <DUT Name="FB_LaserScannerR2000_Messwert" Id="{a77612ec-cb94-4337-b8b8-8635a1b7f80a}">
+    <Declaration><![CDATA[TYPE FB_LaserScannerR2000_Messwert :
+STRUCT
+	//Die gemessene Entfernung zum Messobjekt in mm
+	distanz : UDINT;
+	//Der Winkel der Messung in Grad
+	winkel : REAL;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

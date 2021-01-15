@@ -1,0 +1,369 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4018.5">
+  <POU Name="FB_httpClient" Id="{a1c3d462-e963-4030-8f3d-a57f1b6a7e02}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_httpClient
+VAR_INPUT
+	cmd : FB_httpClient_cmd;
+	//Die IP-Adresse des Empfängers
+	zielAdresse : STRING(15);
+	//Der Port des Empfängers zu dem gesendet werden soll
+	zielPort : UINT;	
+END_VAR
+
+VAR_OUTPUT
+	status : FB_httpClient_status;
+END_VAR
+
+VAR
+	_state : FB_httpClient_State := FB_httpClient_State.GETRENNT; //initialisieren	
+	//Immer wenn vor dem Senden zunächst eine Verbindung aufgebaut werden muss, wird diese Variable genutzt um anschließend im State "Verbunden" das Senden zu triggern.
+	_firstRun : BOOL;
+	//Zeigt an ob in der messageEntpacken Methode der erste Teil der Antwort analysiert wird oder der zweite oder abgeschlossen ist
+	_untersuchterAntwortTeil : FB_httpClient_UntersuchungsStatus;
+	
+	
+	
+//FB`s
+	_tcpClient : FB_TcpClient;
+	//TimeOut 
+	_timeOutAntwortErfassen : Tc2_Standard.TON;
+	//Wartezeit um dem Ziel-Server Zeit zu geben auf einen Request zu antworten
+	_warteAntwortErfassen : Tc2_Standard.TON;
+END_VAR
+
+VAR CONSTANT 
+	TIMEOUT_ANTWORT_ERFASSEN : TIME := T#5S;
+	WARTE_ZEIT_SERVER : TIME := T#200MS;
+	//Mögliche Zustände des Requests:
+	OK : UINT := 200;
+	BAD_REQUEST : UINT := 400;
+	FORBIDDEN : UINT := 403;
+	NOT_FOUND : UINT := 404;
+	METHOD_NOT_ALLOWED : UINT := 405;  
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[(*
+Beschreibung:
+Dieser FB dient der Kommunikation mittels HTTP/1.0 Protokoll mit dem LaserScanner OMDxxx–R2000
+der Firma Pepperl + Fuchs.
+
+Autor: P. Hahn
+Datum: 2016/DEC/07
+Version: 1.0.0.3
+
+Benötigte Bibliotheken:
+	-> Tc2_TcpIp
+	-> Tc2_Utilities
+	
+Benötigte FB´s:
+	->FB_TcpClient
+	
+Benötigte Lizensen:
+	-> TF6310
+
+Weiteres:
+Außerdem wird das Sublement "TF6310-TCP-IP.exe" benötigt.
+Dahinter verbirgt sich ein Server, der die Kopplung zu den verwendeten Sockets vornimmt.
+Der Server kann von der Beckhoff Seite herunter geladen werden.
+Danach sollte der Server auch gestartet werden. Die exe ist zu finden unter "C:\TwinCAT\Functions\TF6310-TCP-IP\Win32\Server"
+*)
+
+
+
+CASE _state OF
+	
+	FB_httpClient_State.GETRENNT:
+	//Soll ein Message-senden durchgeführt werden und es ist noch keine
+	//Verbindung aufgenommen worden, wird zuerst eine Verbindung aufgebaut.
+		IF cmd.senden THEN
+			cmd.senden := FALSE;
+			_firstRun := TRUE;
+			status.busy := TRUE;
+			_tcpClient.cmd.verbinden := TRUE;
+		ELSIF _tcpClient.status.error AND NOT status.busy THEN
+			status.errorId := _tcpClient.status.errorId;
+			status.errorMeldung := 'Der TCP-Client meldet einen Fehler während der HTTP-FB im GETRENNT-Zustand war';
+			_state := FB_httpClient_State.ERROR_HANDLER;
+		END_IF
+		
+		//Warten bis die Verbindung erfolgreich hergestellt wurde
+		IF _tcpClient.status.verbunden AND NOT _tcpClient.status.error THEN
+			_state := FB_httpClient_State.VERBUNDEN;
+		ELSIF _tcpClient.status.error AND status.busy THEN
+			status.errorId := _tcpClient.status.errorId;
+			status.errorMeldung := 'Fehler beim verbinden mit dem Ziel-Server';
+			_state := FB_httpClient_State.ERROR_HANDLER;
+		END_IF			
+		
+	
+	FB_httpClient_State.VERBUNDEN:
+		IF cmd.senden OR _firstRun THEN
+			cmd.senden := FALSE;
+			_firstRun := FALSE;
+			status.busy := TRUE;
+			_tcpClient.cmd.message := messageBauen(); 
+			_tcpClient.cmd.senden := TRUE;
+			_state := FB_httpClient_State.SENDEN;
+		//Sollte der TCP-Client melden, dass die Verbindung zum Ziel-Server unterbrochen wurde,
+		//wird wieder zurück in den State "GETRENNT" gewechselt.
+		ELSIF NOT _tcpClient.status.verbunden THEN
+			_state := FB_httpClient_State.GETRENNT;
+		//Sollte ein Fehler im TCP-Client auftreten während der State "Verbunden" aktiev ist wird in den 
+		//wird in den Error Handler gesprungen
+		ELSIF _tcpClient.status.error THEN
+			status.errorId := _tcpClient.status.errorId;
+			status.errorMeldung := 'Der TCP-Client meldet einen Fehler während der HTTP-FB im VERBUNDEN-Zustand war';
+			_state := FB_httpClient_State.ERROR_HANDLER;
+		END_IF
+		
+		
+	FB_httpClient_State.SENDEN:	
+		IF NOT _tcpClient.status.busy AND NOT _tcpClient.status.error THEN
+			_warteAntwortErfassen.IN := TRUE;
+			//Eine kurze Wartezeit abwarten um dem Ziel-Server Zeit zu geben zu antworten
+			IF _warteAntwortErfassen.Q THEN
+				_warteAntwortErfassen.IN := FALSE;
+				_timeOutAntwortErfassen.IN := TRUE;
+				_untersuchterAntwortTeil := FB_httpClient_UntersuchungsStatus.HEADER;
+				_state := FB_httpClient_State.ANTWORT_ERFASSEN;
+			END_IF
+		ELSIF _tcpClient.status.error THEN
+			status.errorId := _tcpClient.status.errorId;
+			status.errorMeldung := 'Fehler beim senden der Nachticht an den Ziel-Server';
+			_state := FB_httpClient_State.ERROR_HANDLER;
+		END_IF
+		
+		
+	//Warten bis eine Message empfangen wurde.
+	FB_httpClient_State.ANTWORT_ERFASSEN:
+		//Solange neue Nachrichten einlesen und in der Analyse Methode "messageEntpacken()" untersuchen bis der Status
+		//der Untersuchung auf FERTIG wechselt.
+		IF _tcpClient.status.neueMessage THEN
+			_tcpClient.cmd.messageAuslesen := TRUE;
+			_state := FB_httpClient_State.ANTWORT_AUSWERTEN;
+		//Ist keine weitere Message im Puffer fehlt der Payload und es wird ein Fehler gemeldet
+		ELSIF NOT _tcpClient.status.neueMessage AND _untersuchterAntwortTeil = FB_httpClient_UntersuchungsStatus.PAYLOAD THEN
+			status.errorId := 0;
+			status.errorMeldung := 'Die Antwort des Ziel-Servers ist unvollständig';
+			_state := FB_httpClient_State.ERROR_HANDLER;	
+		//Ist die Zeit abgelaufen und das ANTWORT_ERFASSEN ist noch nicht abgeschlossen, geht die Statemachine in Error
+		ELSIF _timeOutAntwortErfassen.Q THEN
+			status.errorId := 0;
+			status.errorMeldung := 'Das empfangen der Antwort des Ziel-Servers dauert zu lange';
+			_state := FB_httpClient_State.ERROR_HANDLER;	
+		END_IF	
+			
+			
+	//Die Antwort analysieren		
+	FB_httpClient_State.ANTWORT_AUSWERTEN:	
+		IF NOT _tcpClient.status.busy AND NOT _tcpClient.status.error THEN
+				messageEntpacken();
+		END_IF
+	
+		//Wurde die Analyse beendet und es sind auch keine weiteren Nachtichten im TCP-Client Puffer dann kann das 
+		//"Antwort erfassen" verlassen werden	
+		IF _untersuchterAntwortTeil = FB_httpClient_UntersuchungsStatus.FERTIG AND NOT _tcpClient.status.neueMessage THEN
+			status.busy := FALSE;
+			_timeOutAntwortErfassen.IN := FALSE;
+			IF _tcpClient.status.verbunden THEN
+				_state := FB_httpClient_State.VERBUNDEN;
+			ELSE
+				_state := FB_httpClient_State.GETRENNT;	
+			END_IF
+			
+		//Ist die Zeit abgelaufen und das ANTWORT_ERFASSEN ist noch nicht abgeschlossen, geht die Statemachine in Error
+		ELSIF _timeOutAntwortErfassen.Q THEN
+			status.errorId := 0;
+			status.errorMeldung := 'Das empfangen der Antwort des Ziel-Servers dauert zu lange';
+			_state := FB_httpClient_State.ERROR_HANDLER;
+			
+		//Sollte der Analysevorgang der Antwort des Ziel-Servers beendet sein aber es sind noch neue Messages im Puffer des 
+		//TCP Clients dann führt das zu einer Fehlermeldung und deutet darauf hin, dass z.B. die Antwort des Ziel-Servers
+		//ungewöhnlich lange ist.	
+		ELSIF _untersuchterAntwortTeil = FB_httpClient_UntersuchungsStatus.FERTIG AND _tcpClient.status.neueMessage THEN
+			status.errorId := 0;
+			status.errorMeldung := 'Der TCP-Client hat weitere Nachriten empfangen obwohl die Analyse bereits beendet ist';
+			_state := FB_httpClient_State.ERROR_HANDLER;
+			
+		ELSIF _tcpClient.status.error THEN
+			status.errorId := _tcpClient.status.errorId;
+			status.errorMeldung := 'Der TCP-Client meldet während des Antwortempfangens einen Fehler';
+			_state := FB_httpClient_State.ERROR_HANDLER;
+		END_IF
+		
+			
+	//Error-Handler	
+	FB_httpClient_State.ERROR_HANDLER:
+		status.busy := FALSE;
+		status.error := TRUE;
+		_untersuchterAntwortTeil := HEADER;
+		_warteAntwortErfassen.IN := FALSE;
+		_timeOutAntwortErfassen.IN := FALSE;
+		_tcpClient.cmd.messagePufferLeeren := TRUE;
+		IF _tcpClient.status.error THEN
+			_tcpClient.cmd.reset := TRUE;
+		ELSE
+			_tcpClient.cmd.trennen := TRUE;
+		END_IF
+		IF cmd.reset THEN
+			cmd.reset := FALSE;
+			status.error := FALSE;
+			status.errorId := 0;
+			status.errorMeldung := '';
+			_state := FB_httpClient_State.GETRENNT;
+		END_IF		
+END_CASE
+
+
+
+//FB´s
+_tcpClient(
+	zielAdresse := zielAdresse,
+	zielPort := zielPort,
+	enableVerbindungsverlustFehler := FALSE);
+	
+_timeOutAntwortErfassen(
+	PT := TIMEOUT_ANTWORT_ERFASSEN);
+	
+_warteAntwortErfassen(
+	PT := WARTE_ZEIT_SERVER);]]></ST>
+    </Implementation>
+    <Method Name="messageBauen" Id="{8446e013-dc89-494e-ac58-c93c035d6628}">
+      <Declaration><![CDATA[METHOD PROTECTED messageBauen : STRING(255)
+VAR_INPUT
+END_VAR
+VAR
+	buffer : STRING(255);
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[
+//Die zu sendende Message mit den http-Protokoll Befehlen verknüpfen
+//Beispiel -->  GET <zuSendendeMessage> HTTP/1.0$R$N$R$N
+//Dabei steht $R für ein Carriage return also <CR> bzw. \r
+//Und $N ist die Ersatzdarstellung eines line feed also <LF> bzw. \n
+//Die Kombination von <CR><LF><CR><LF> gibt das Ende des HTTP-Header an
+buffer := Tc2_Standard.CONCAT('GET ', cmd.message);
+messageBauen := Tc2_Standard.CONCAT(buffer, ' HTTP/1.0$R$NConnection: keep-alive$R$N$R$N');
+RETURN;
+
+
+
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="messageEntpacken" Id="{9d6a52a9-7fbf-4ca1-a48e-5e0ba86909ad}">
+      <Declaration><![CDATA[METHOD PROTECTED messageEntpacken
+VAR_INPUT
+END_VAR
+
+VAR
+	requestStatus : UINT;
+	buffer : STRING(255);
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[
+//Hier wird in zwei Schritten die Antwort des Ziel-Servers ausgewertet.
+//Im 1. Schritt wird der Header der empfangenen Antwort untersucht um festzustellen ob der Request an den
+//Zielserver erfolgreich war.
+//Im zweiten Schritt wird dann die eigentliche Antwort des Ziel-Servers ausgewertet und ausgegeben
+
+IF _untersuchterAntwortTeil = FB_httpClient_UntersuchungsStatus.HEADER THEN
+	//Die Erste Message beinhaltet den Header der Antwort des Ziel-Servers.
+	//Sie gibt Auskunft über den Erfolg oder Misserfolg des Requests.
+	requestStatus := STRING_TO_UINT(Tc2_Standard.MID(STR := _tcpClient.status.message, POS := 10, LEN := 3));
+
+	CASE requestStatus OF
+		OK:
+			//Die Komunikation ist erfolgreich, also den nächsten Teil der Antwort auslesen lassen und im nächsten Schritt untersuchen 
+			_untersuchterAntwortTeil := FB_httpClient_UntersuchungsStatus.PAYLOAD;
+			_state := FB_httpClient_State.ANTWORT_ERFASSEN;
+			RETURN;
+			
+		BAD_REQUEST:
+			status.errorId := 0;
+			status.errorMeldung := 'Der Request an den Ziel-Server hat eine falsche URI-Syntax';
+			_state := FB_httpClient_State.ERROR_HANDLER;
+			RETURN;
+			
+		FORBIDDEN:
+			status.errorId := 0;
+			status.errorMeldung := 'Der Ziel-Server verweigert den Zugriff';
+			_state := FB_httpClient_State.ERROR_HANDLER;
+			RETURN;
+			
+		NOT_FOUND:
+			status.errorId := 0;
+			status.errorMeldung := 'Der Befehl des gesendeten Request ist dem Ziel-Server nicht bekannt';
+			_state := FB_httpClient_State.ERROR_HANDLER;
+			RETURN;
+			
+		METHOD_NOT_ALLOWED:
+			status.errorId := 0;
+			status.errorMeldung := 'Die verwendete HTTP-Methode wird vom Ziel-Server nicht zugelassen';
+			_state := FB_httpClient_State.ERROR_HANDLER;
+			RETURN;
+			
+		ELSE
+			status.errorId := 0;
+			status.errorMeldung := 'Unbekannter Fehler bei der Analyse der Antwort des Ziel-Servers';
+			_state := FB_httpClient_State.ERROR_HANDLER;
+			RETURN;
+	END_CASE
+
+	
+ELSIF _untersuchterAntwortTeil = FB_httpClient_UntersuchungsStatus.PAYLOAD THEN
+	//Die zweite Message beinhaltet den Payload der Antwort des Ziel-Servers.
+	//Hier können die Nutzdaten ausgewertet werden.
+	//Eine übliche Antwort des LaserSacnners sieht z.B. so aus:
+	// {$R$N"handle":"s57701486",$R$N"error_code":0,$R$N"error_text":"success"$R$N}
+	 buffer := stringZerlegen(inputString := _tcpClient.status.message, lesenVon := '{$R$N', lesenBis := '$R$N}$R$N');
+	 IF buffer <> '' THEN
+		status.antwort := buffer;
+		_untersuchterAntwortTeil := FB_httpClient_UntersuchungsStatus.FERTIG;
+	ELSE
+		status.errorId := 0;
+		status.errorMeldung := 'Die Antwort des Ziel_Servers konnte nicht richtig interpretiert werden';
+		_state := FB_httpClient_State.ERROR_HANDLER;
+	END_IF
+	RETURN;
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="stringZerlegen" Id="{b1b63163-8409-420a-88e1-3907a2461fd7}">
+      <Declaration><![CDATA[METHOD PROTECTED stringZerlegen : STRING(255)
+VAR_INPUT
+	inputString : STRING(255);
+	lesenVon : STRING(80);
+	lesenBis : STRING(80);
+END_VAR
+VAR
+	_vonPosition : INT;
+	_bisPosition : INT;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[//Diese Methode untersucht einen Übergebenen String nach einem Teilstring der zwischen 
+//lesenVon und lesenBis liegt. Dieser wird zurückgegeben.
+
+
+//Startposition ermitteln:
+_vonPosition := Tc2_Standard.FIND(STR1 := inputString, STR2 := lesenVon);
+_vonPosition := _vonPosition + Tc2_Standard.LEN(lesenVon);
+
+//Endposition ermitteln:
+_bisPosition := Tc2_Standard.FIND(STR1 := inputString, STR2 := lesenBis);
+
+//Überprüfen ob ein Teilstring zwischen den Grenzen gefunden werden kann.
+//Falls nicht wird ein Leer-String zurückgegebn
+IF _vonPosition = _bisPosition OR _vonPosition > _bisPosition THEN
+	stringZerlegen := '';
+//Ansonsten gesuchten String auslesen:
+ELSE
+	stringZerlegen := Tc2_Standard.MID(STR := inputString, POS := _vonPosition, LEN := _bisPosition - Tc2_Standard.LEN(lesenVon) - 1);
+END_IF
+RETURN;]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

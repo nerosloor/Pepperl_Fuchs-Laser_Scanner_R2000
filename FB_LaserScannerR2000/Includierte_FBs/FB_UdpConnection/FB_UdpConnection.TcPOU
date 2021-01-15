@@ -1,0 +1,287 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4018.5">
+  <POU Name="FB_UdpConnection" Id="{9294fe7a-f5f9-43bc-b830-30a7e87b6431}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_UdpConnection
+
+VAR_INPUT
+	//CMD
+	cmd : FB_UdpConnection_cmd;
+	//Die IP-Adresse des Empfängers
+	zielAdresse : STRING(15);
+	//Der Port des Empfängers zu dem gesendet werden soll
+	zielPort : UINT;
+	//Die IP-Adresse des Netzwerkadapters mittels dem die Verbindung hergestellt werden soll (eigene IP)
+	quellAdresse : STRING(15);
+	//Der Port der geöffnet werden soll
+	quellPort : UINT; 
+	//Ist die Variable TRUE werden die Messagedaten als ByteArrayType ausgegeben. Ansonsten werden die Messagedaten als StringType ausgegeben.
+	messageAusgabeByte : BOOL;
+END_VAR
+
+VAR_OUTPUT
+	//Status
+	status : FB_UdpConnection_status;
+END_VAR
+	
+VAR
+	_state : FB_UdpConnection_State := FB_UdpConnection_State.GETRENNT; //Initialisieren
+	//In das Bytearray werden die empfangenen Daten zunächst zwischen gespeichert
+	_empfangsPuffer		: ARRAY[0..PUFFER_GROESSE-1] OF BYTE;
+	//Es handelt sich um ein 2D-Array. Der erste Index steht für die Puffergröße und der zweite Index für die Anzahl aufzunehmender Bytes pro Message
+	_messagePufferByte : ARRAY[0..MESSAGE_PUFFER_GROESSE-1, 0..PUFFER_GROESSE-1] OF BYTE;
+	//Der Pointer wird benötigt um die empfangenen Bytes aus dem _messagePufferByte auszulesen
+	_pufferPointer : POINTER TO ARRAY[0..PUFFER_GROESSE-1] OF BYTE;
+	//Index zum eintragen der Messages in den messagePuffer
+	_indexMessageIn : UINT := 0;
+	//Index zum austragen der Messages aus den messagePuffer
+	_indexMessageOut : UINT := 0;
+	
+	
+	//Laufvariable für for-Schleifen
+	_n : INT;
+	//FB's
+	_socketVerbindung 	: Tc2_TcpIp.FB_SocketUdpCreate;
+	_socketSenden 		: Tc2_TcpIp.FB_SocketUdpSendTo;
+	_socketEmpfangen 	: Tc2_TcpIp.FB_SocketUdpReceiveFrom;
+	_socketTrennen 		: Tc2_TcpIp.FB_SocketClose;
+END_VAR
+
+VAR CONSTANT
+	//Die Anzahl der Bytes einer Message die das Array abspeichern soll. Die Gleiche Anzahl muss auch für die Variable "message" im Status-Struct angegeben werden.
+	PUFFER_GROESSE : UINT := 2048;
+	//Die Anzahl der Messages die zwischengespeichert werden. Bei einem Buffer-overflow wird der Beginn des Arrays erneut beschrieben.
+	//Dabei besteht die gefahr, dass noch nicht ausgelesene Messages überschrieben werden
+	MESSAGE_PUFFER_GROESSE : UINT := 20;
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[(*
+Beschreibung:
+Dieser FB baut eine Socketverbindung mittels des Beckhoff eigenen Sublements "TF6310" auf.
+Dabei handelt es sich um einen TCP/IP-Server, der ein entsprechndes Binding vornimmt.
+Via UDP können Messages an einen Ziel-Socket versendet werden. 
+Und Messages an die erstellte Socketverbindung können empfangen werden.
+
+Autor: P. Hahn
+Datum: 2016/NOV/11
+Version: 1.0.0.5
+
+Benötigte Bibliotheken:
+	-> Tc2_TcpIp
+	-> Tc2_Utilities
+	
+Benötigte Lizensen:
+	-> TF6310
+
+Weiteres:
+Außerdem wird das Sublement "TF6310-TCP-IP.exe" benötigt.
+Dahinter verbirgt sich ein Server, der die Kopplung zu den verwendeten Sockets vornimmt.
+Der Server kann von der Beckhoff Seite herunter geladen werden.
+Danach sollte der Server auch gestartet werden. Die exe ist zu finden unter "C:\TwinCAT\Functions\TF6310-TCP-IP\Win32\Server"
+*)
+
+
+
+CASE _state OF
+	
+	//Es besteht keine Verbindung
+	FB_UdpConnection_State.GETRENNT:
+		IF cmd.verbinden THEN
+			cmd.verbinden := FALSE;
+			status.busy := TRUE;
+			_socketVerbindung.sLocalHost := quellAdresse;
+			_socketVerbindung.nLocalPort := quellPort;
+			_socketVerbindung.bExecute := TRUE;
+			_state := FB_UdpConnection_State.VERBINDEN;
+		ELSIF cmd.messageAuslesen THEN
+			cmd.messageAuslesen := FALSE;
+			status.busy := TRUE;
+			_state := FB_UdpConnection_State.MESSAGE_AUSLESEN;
+		ELSIF cmd.trennen THEN
+			cmd.trennen := FALSE;
+		END_IF
+		
+		
+	//Es wird der Port am angegebenen Netzwerkadapter geöffnet
+	FB_UdpConnection_State.VERBINDEN:
+		IF NOT _socketVerbindung.bBusy AND NOT _socketVerbindung.bError THEN
+			_socketVerbindung.bExecute := FALSE;
+			status.busy := FALSE;
+			status.verbunden := TRUE;
+			_state := FB_UdpConnection_State.VERBUNDEN;
+		ELSIF _socketVerbindung.bError THEN
+			status.errorId := _socketVerbindung.nErrId;
+			status.errorMeldung := 'Fehler beim öffnen des Ports';
+			_state := FB_UdpConnection_State.ERROR_HANDLER;
+		END_IF
+
+		
+	//Der Port ist erfolgreich geöffnet
+	FB_UdpConnection_State.VERBUNDEN:
+		IF cmd.senden THEN
+			cmd.senden := FALSE;
+			status.busy := TRUE;
+			_socketSenden.sRemoteHost := zielAdresse;
+			_socketSenden.nRemotePort := zielPort;
+			_socketSenden.pSrc := ADR(cmd.message);
+			_socketSenden.cbLen := INT_TO_UDINT(LEN(cmd.message));
+			_socketSenden.bExecute := TRUE;
+			//Das empfangen beenden
+			_socketEmpfangen(bExecute := FALSE);
+			_state := FB_UdpConnection_State.SENDEN;
+		ELSIF cmd.trennen THEN
+			cmd.trennen := FALSE;
+			status.busy := TRUE;
+			_socketTrennen.bExecute := TRUE;		
+			_state := FB_UdpConnection_State.TRENNEN;
+		ELSIF cmd.messageAuslesen THEN
+			cmd.messageAuslesen := FALSE;
+			status.busy := TRUE;
+			_state := FB_UdpConnection_State.MESSAGE_AUSLESEN;
+		ELSIF cmd.verbinden THEN
+			cmd.verbinden := FALSE;	
+		END_IF
+		
+		
+	//Es wird eine Message an den Ziel-Socket gesendet
+	FB_UdpConnection_State.SENDEN:
+		IF NOT _socketSenden.bBusy AND NOT _socketSenden.bError THEN
+			_socketSenden.bExecute := FALSE;
+			status.busy := FALSE;
+			_state := FB_UdpConnection_State.VERBUNDEN;
+		ELSIF _socketSenden.bError THEN
+			status.errorId := _socketSenden.nErrId;
+			status.errorMeldung := 'Fehler beim Senden der Nachricht!';
+			_state := FB_UdpConnection_State.ERROR_HANDLER;
+		END_IF
+		
+	
+	//Es wird eine empfangene Message aus dem messagePuffer ausgelesen
+	FB_UdpConnection_State.MESSAGE_AUSLESEN:
+		IF status.neueMessage THEN
+			//Mittels Pointer auf das entsprechende Byte-Array verweisen und dann als Message ausgeben
+			_pufferPointer := ADR(_messagePufferByte[_indexMessageOut,0]);
+			//Message als ByteArray ausgeben
+			status.message := _pufferPointer^;
+			//Den Index zum auslesen der Messages aus dem Puffer um 1 erhöhen, bzw. beim Überlauf wieder auf 0 setzen
+			_indexMessageOut := (_indexMessageOut + 1) MOD MESSAGE_PUFFER_GROESSE;
+		ELSE
+			//Ist keine neue Message vorhanden wird ein genulltes ByteArray ausgegeben 
+			FOR _n := 0 TO UINT_TO_INT(PUFFER_GROESSE-1) BY 1 DO
+				status.message[_n] := 0;
+			END_FOR
+		END_IF
+		status.busy := FALSE;
+		IF status.verbunden THEN
+			_state := FB_UdpConnection_State.VERBUNDEN;
+		ELSE
+			_state := FB_UdpConnection_State.GETRENNT;
+		END_IF
+		
+		
+	//Die Verbindung wird wieder getrennt	
+	FB_UdpConnection_State.TRENNEN:
+		IF NOT _socketTrennen.bBusy AND NOT _socketTrennen.bError THEN
+			_socketTrennen.bExecute := FALSE;
+			status.verbunden := FALSE;
+			status.busy := FALSE;
+			_state := FB_UdpConnection_State.GETRENNT;
+		ELSIF _socketTrennen.bError THEN
+			status.errorId := _socketTrennen.nErrId;
+			status.errorMeldung := 'Fehler beim Trennen der Verbindung!';
+			_state := FB_UdpConnection_State.ERROR_HANDLER;
+		END_IF
+		
+				
+	//Error-Handler	
+	FB_UdpConnection_State.ERROR_HANDLER:
+		status.busy := FALSE;
+		status.error := TRUE;
+		_socketVerbindung.bExecute := FALSE;
+		_socketSenden.bExecute := FALSE;
+		_socketEmpfangen(bExecute := FALSE);
+		_socketTrennen.bExecute := FALSE;
+		IF cmd.reset THEN
+			cmd.reset := FALSE;
+			status.error := FALSE;
+			status.errorId := 0;
+			status.errorMeldung := '';
+			IF status.verbunden THEN
+				_state := FB_UdpConnection_State.VERBUNDEN;
+			ELSE
+				_state := FB_UdpConnection_State.GETRENNT;
+			END_IF
+		END_IF	
+END_CASE
+
+//================================================================================
+//								Daten Empfangen
+//================================================================================
+IF status.verbunden AND _state <> FB_UdpConnection_State.ERROR_HANDLER THEN
+	_socketEmpfangen( hSocket := _socketVerbindung.hSocket, cblen := PUFFER_GROESSE, pDest := ADR(_empfangsPuffer), tTimeout := T#10S, bExecute := TRUE);
+	IF NOT _socketEmpfangen.bBusy AND NOT _socketEmpfangen.bError THEN
+		_socketEmpfangen(bExecute := FALSE);
+		//Wenn Bytes empfangen wurden, dann werden sie in den messagePuffer geschrieben
+		IF _socketEmpfangen.nRecBytes > 0 THEN
+			//Daten aus dem Empfangspuffer als Bytes in den entsprechenden Puffer schreiben und dabei den Empfangspuffer wieder nullen
+			FOR _n := 0 TO UDINT_TO_INT(_socketEmpfangen.nRecBytes-1) BY 1 DO
+				_messagePufferByte[_indexMessageIn, _n] := _empfangsPuffer[_n];
+				_empfangsPuffer[_n] := 0;
+			END_FOR	
+			//Den Index zum eintragen der Messages in den Puffer um 1 erhöhen, bzw. beim Überlauf wieder auf 0 setzen
+			_indexMessageIn := (_indexMessageIn + 1) MOD MESSAGE_PUFFER_GROESSE;
+			//Um zu verhindern, dass der EinfügeIndex nach einem Pufferüberlauf nicht den AusleseIndex überrunden kann,
+			//wird der AusleseIndex immer um eins erhöht und somit wird die älteste Massage verworfen.
+			//Normalerweise sollte das aber natürlich nicht passieren. Daher sollte die MESSAGE_PUFFER_GROESSE ausreichend groß sein. 
+			IF _indexMessageIn = _indexMessageOut THEN
+				_indexMessageOut := (_indexMessageOut + 1) MOD MESSAGE_PUFFER_GROESSE;
+			END_IF
+		END_IF
+	ELSIF _socketEmpfangen.bError THEN
+		status.errorId := _socketEmpfangen.nErrId;
+		status.errorMeldung := 'Fehler beim Empfangen einer Nachricht!';
+		_state := FB_UdpConnection_State.ERROR_HANDLER;			
+	END_IF
+END_IF
+
+
+//Anzeigen, wenn eine neue Message vorhanden ist
+IF _indexMessageIn <> _indexMessageOut THEN
+	status.neueMessage := TRUE;
+ELSE
+	status.neueMessage := FALSE;
+END_IF
+
+
+//Leeren des MessagPuffers
+//Dabei wird nicht das Array geleert sondern lediglich die Indices für das Einfügen und Auslesen der Messages werden gleich
+//gesetzt. Dadurch sind die Nachrichten für den Nutzer des FB´s nicht mehr auslesbar.
+IF cmd.messagePufferLeeren THEN
+	cmd.messagePufferLeeren := FALSE;
+	_indexMessageOut := _indexMessageIn;
+END_IF
+
+
+
+//FB`s
+_socketVerbindung(
+	tTimeout := T#5S);
+
+_socketSenden(
+	hSocket := _socketVerbindung.hSocket,
+	tTimeout := T#5S);
+
+_socketTrennen(
+	hSocket := _socketVerbindung.hSocket,
+	tTimeout := T#5S);
+
+
+
+
+
+
+
+
+]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

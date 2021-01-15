@@ -1,0 +1,16 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4018.5">
+  <DUT Name="FB_httpClient_cmd" Id="{f5fcb35a-39e4-462c-baf4-f51956bd5932}">
+    <Declaration><![CDATA[TYPE FB_httpClient_cmd :
+STRUCT
+	//Die Message versenden
+	senden : BOOL;
+	//Beinhaltet den Text der zu sendenden Message
+	message : STRING(255);
+	//Error quittieren
+	reset : BOOL;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

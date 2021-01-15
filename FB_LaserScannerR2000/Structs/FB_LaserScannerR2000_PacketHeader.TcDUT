@@ -1,0 +1,29 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4018.5">
+  <DUT Name="FB_LaserScannerR2000_PacketHeader" Id="{fcf8fd63-b9dd-485d-8b7e-8ca148663876}">
+    <Declaration><![CDATA[TYPE FB_LaserScannerR2000_PacketHeader :
+STRUCT
+	
+//Die Variablen für den Paket-Header eines Packettyps A --> Siehe Protokollbeschreibung S. 42
+	packet_type : UINT; 
+	 packet_size : UDINT; 
+	 header_size : UINT; 
+	 scan_number : UINT; 
+	 packet_number : UINT;
+	
+	 status_flags : UDINT; 
+	 scan_frequency : UDINT;
+	 num_points_scan : UINT; 
+	 num_points_packet : UINT; 
+	 first_index : UINT; 
+	 first_angle : DINT; 
+	 angular_increment : DINT; 
+	
+	 iq_input : UDINT; 
+	 iq_overload : UDINT; 
+	 header_padding : UDINT;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4018.5">
+  <DUT Name="FB_httpClient_UntersuchungsStatus" Id="{76da738f-9a4f-412a-86e1-9d26e58bee98}">
+    <Declaration><![CDATA[TYPE FB_httpClient_UntersuchungsStatus :
+(
+	HEADER := 0,
+	PAYLOAD,
+	FERTIG
+);
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

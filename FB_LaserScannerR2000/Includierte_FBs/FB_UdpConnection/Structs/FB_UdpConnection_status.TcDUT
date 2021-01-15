@@ -1,0 +1,24 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4018.5">
+  <DUT Name="FB_UdpConnection_status" Id="{6a0cc4a1-a828-4bc0-9985-9b77ade5d229}">
+    <Declaration><![CDATA[TYPE FB_UdpConnection_status :
+STRUCT
+	//Wird TRUE wenn der Baustein arbeitet
+	busy : BOOL;
+	//Beinhaltet die message die aus dem Puffer ausgelesen wurde
+	message : ARRAY[0..2047] OF BYTE;
+	//Sind eine oder mehrere Messages im messagePuffer wird die Variable True
+	neueMessage : BOOL;
+	//Ein Fehler ist aufgetreten!
+	error : BOOL;
+	//ErrorID
+	errorId : UDINT;
+	//Error Meldung
+	errorMeldung : STRING(255);
+	//Wird TRUE wenn eine Verbindung besteht
+	verbunden : BOOL;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

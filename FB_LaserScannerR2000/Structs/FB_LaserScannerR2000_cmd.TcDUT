@@ -1,0 +1,24 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4018.5">
+  <DUT Name="FB_LaserScannerR2000_cmd" Id="{7f5b400a-65fe-4e8d-b01c-c8e909a3bac9}">
+    <Declaration><![CDATA[TYPE FB_LaserScannerR2000_cmd :
+STRUCT
+	//Startet den LaserScanner
+	start : BOOL;
+	//Der Schwellwert für gültige Messwerte in mm. Nur Werte die unterhalb dieses Schwellwerts liegen werden von dem Baustein ausgegeben
+	schwelle : UDINT;
+	//Der LaserScanner wird mit diesen Daten initialisiert wenn gestartet wird
+	scanParameter : FB_LaserScannerR2000_ScanParameter;
+	//Wenn Messdaten vorliegen können sie ausgelesen werden wenn diese Variable TRUE wird
+	messdatenAuslesen : BOOL;
+	//Den LaserScanner Stoppen
+	stop : BOOL;
+	//Error quittieren
+	reset : BOOL;
+	//Die aktuellen Messdaten verwerfen
+	messdatenVerwerfen : BOOL;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

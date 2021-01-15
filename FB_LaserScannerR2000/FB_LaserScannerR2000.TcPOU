@@ -1,0 +1,801 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4018.5">
+  <POU Name="FB_LaserScannerR2000" Id="{c41f68f3-1e10-4bd3-8645-7dff87f0b0d7}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_LaserScannerR2000
+VAR_INPUT
+	cmd : FB_LaserScannerR2000_cmd;
+	//Die IP-Adresse des LaserScanners
+	ipLaserScanner : STRING(15);
+	//Die IP-Adresse des Systems das die Messdaten des LaserScanners empfangen soll (in der Regel die SPS selbst)
+	ipMessdatenEmpfaenger : STRING(15);	
+	//Der Port des Systems das die Messdaten des LaserScanners empfangen soll (in der Regel die SPS selbst)
+	portMessdatenEmpfaenger : UINT;
+END_VAR
+
+VAR_OUTPUT
+	status : FB_LaserScannerR2000_status;
+END_VAR
+
+VAR
+	_state : FB_LaserScannerR2000_State := FB_LaserScannerR2000_State.STAND_BY;
+	//Lokale Kopie der Scanparameter. Wurde der Prozess gestartet, kann auf diese Weise die übergebenen Paramerter nicht verändert werden 
+	_scanParameter : FB_LaserScannerR2000_ScanParameter;
+	//Das Ergebnis der berechnung aus der gewünschten Auflösung in der Methode parameterMessage() 
+	_sampelsPerScanErgebnis : UINT;
+	
+	_serverAntwort : FB_LaserScannerR2000_Antwort;
+	//Der aktuelle Handle der vom LaserScanner-Server vergeben wurde 
+	_handle : STRING(20);
+	
+	//Zählindex um das empfangene Array zu unteruschen, der hochzählt, wenn der Start einer neuen Nachricht ermittelt wird (Byte = 5C gefolgt von Byte = A2)
+	_i : UINT := 0;
+	//Zähler um das Ausgewertete Array zu erstellen
+	_n : UINT := 0;
+	
+	_messagePuffer : ARRAY[0..2047] OF BYTE;
+	//Die Werte die im Header eines jeden Paketes stehen werden hier erfasst
+	_header : FB_LaserScannerR2000_PacketHeader;
+	//Der angepasste Winkel des ersten Messwertes des aktuellen Paketes
+	_firstAngle : REAL;
+	//Puffer Variable um die For-schleife, die die Messwerte untersucht performanter zu machen 
+	_distanzMessung : UDINT;
+	//Puffer Variable um die For-schleife, die die Messwerte untersucht performanter zu machen 
+	_winkelPuffer : REAL;
+	
+	//Legt fest, wenn aus dem UDP-Puffer eine Message vollständig erfasst wurde
+	_packetErfasst : BOOL := False;
+	_auswertenState : FB_LaserScannerR2000_State := FB_LaserScannerR2000_State.START_WORD_PRUEFEN;
+	
+	//FB`s
+	_http : FB_httpClient;
+	_udp : FB_UdpConnection;
+END_VAR
+
+VAR CONSTANT
+	//Die Größe des Headers einer Typ A Nachricht in Byte
+	LETZTER_HEADER_INDEX : UINT := 64;
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[
+
+(*
+Beschreibung:
+Dieser FB dient der Steuerung des 2D-LaserScanners OMDxxx–R2000 der Firma Pepperl + Fuchs in der Firmware Version 1.20.
+Es werden lediglich Pakete des Typs A unterstützt!
+
+Ablauf:
+Erhält der Baustein neue Messages aus dem Netzwerk wird das Flag "status.neueMessdaten" = TRUE.
+Um diese Daten in das Array "status.messdaten" zu schreiben muss das Flag "cmd.messdatenAuslesen" mit TRUE beschaltet werden.
+Das ganze sollte zyklisch schnell geschehen. Die Laserscanner drehen mit 50Hz und senden somit alle 20ms Daten. Die Zykluszeit zum Auslesen dieser Daten sollte daher unterhalb diesen 20ms liegen.
+Besondere Vorsicht ist geboten, wenn mehrere Messages gesendet werden müssen um einen Messzyklus zu übertragen. Das ist z.B. dann der Fall wenn die Messauflösung sehr fein gewählt wird und der Messbereich groß.
+Dann könnten daraus z.B. 2000 Messdaten generiert werden die nicht mehr mit einer Message versendet werden, sondern mehrere.
+Wir haben daher eine Messauflösung von 0.5 Grad gewählt. Diese ist ausreichend und leifert genauere (Distanz-) Messwerte.
+Wir haben daher drei parallele Tasks mit einer Zykluszeit von 1ms erstellt in denen jeweils einer der drei LaserScanner gehandelt wird.
+
+Hier die Struktur des FB:
+	
+						FB_LaserScannerR2000
+						|					|
+						|					|
+						|					V
+						|				FB_httpClient
+						|					|
+						|					|
+						V					V	
+				FB_UdpConnection		FB_TcpClient
+						|					|
+						|					|
+						V					V
+				Beckhoff FBs			Beckhoff FBs
+				
+				
+
+Autor: P. Hahn
+
+Datum: 2016/DEC/16
+Version: 1.0.0.1
+
+Benötigte Bibliotheken:
+	-> Tc2_TcpIp
+	-> Tc2_Utilities
+	
+Benötigte FB´s:
+	-> FB_httpClient
+	-> FB_TcpClient
+	-> FB_UdpConnection
+	
+Benötigte Lizensen:
+	-> TF6310
+
+Weiteres:
+Außerdem wird das Sublement "TF6310-TCP-IP.exe" benötigt.
+Dahinter verbirgt sich ein Server, der die Kopplung zu den verwendeten Sockets vornimmt.
+Der Server kann von der Beckhoff Seite herunter geladen werden.
+Danach sollte der Server auch gestartet werden. Die exe ist dann zu finden unter "C:\TwinCAT\Functions\TF6310-TCP-IP\Win32\Server"
+*)
+
+
+CASE _state OF
+	
+	FB_LaserScannerR2000_State.STAND_BY:
+		IF cmd.start AND NOT _http.status.error THEN
+			cmd.start := FALSE;
+			status.busy := TRUE;
+			_udp.cmd.verbinden := TRUE;
+			_state := FB_LaserScannerR2000_State.UDP_PORT_OEFFNEN;
+		ELSIF _http.status.error THEN
+			status.errorId := _http.status.errorId;
+			status.errorMeldung := 'Der http-Client meldet einen Fehler während der Baustein im Zustand STAND-BY war';
+			_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+		END_IF
+
+
+	
+	FB_LaserScannerR2000_State.UDP_PORT_OEFFNEN:		
+		IF NOT _udp.status.busy AND _udp.status.verbunden THEN
+			_scanParameter := cmd.scanParameter;
+			_http.cmd.message := SetParameterMessage();
+			_http.cmd.senden := TRUE;
+		ELSIF _udp.status.error THEN
+			status.errorId := _http.status.errorId;
+			status.errorMeldung := 'Es trat ein Fehler auf beim Verusch den Port für den UDP-Listner zu öffnen';
+			_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+		END_IF
+		
+		
+		
+	FB_LaserScannerR2000_State.PARAMETER_ANTWORT_ABWARTEN:
+		IF NOT _http.status.busy AND NOT _http.status.error THEN
+			antwortAuswerten(handleAuswerten := FALSE);
+			//Sollte der ErrorCode des Servers ungleich 0 sein dann meldet der LaserScanner einen Fehler
+			IF _serverAntwort.error_code > 0 OR _serverAntwort.error_code < 0 THEN
+				status.errorId := 0;
+				status.errorMeldung := Tc2_Standard.CONCAT('Nach dem Senden der Parameter meldet der LaserScanner: ', _serverAntwort.error_text);
+				_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+			//Ansonsten ist alles korrekt verlaufen und es kann fortgefahren werden
+			ELSE
+				//Den String für den "request_handle_udp" Befehl bauen und an den LaserScanner-Server senden 
+				_http.cmd.message := requestHandleMessage();
+				_http.cmd.senden := TRUE;
+			END_IF
+		ELSIF _http.status.error THEN
+			status.errorId := _http.status.errorId;
+			status.errorMeldung := 'Der http-Client meldet einen Fehler beim Auswerten der Antwort nach dem senden der Parameter';
+			_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+		END_IF
+		
+		
+		
+	FB_LaserScannerR2000_State.HANDLE_REQUEST_ANTWORT_ABWARTEN:
+		IF NOT _http.status.busy AND NOT _http.status.error THEN
+			antwortAuswerten(handleAuswerten := TRUE);
+			_handle := _serverAntwort.handle;
+			//Sollte der ErrorCode des Servers ungleich 0 sein dann meldet der LaserScanner einen Fehler
+			IF _serverAntwort.error_code > 0 OR _serverAntwort.error_code < 0 THEN
+				status.errorId := 0;
+				status.errorMeldung := Tc2_Standard.CONCAT('Nach dem Senden des Handle-Requests meldet der LaserScanner: ', _serverAntwort.error_text);
+				_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+			//Ansonsten ist alles korrekt verlaufen und es kann fortgefahren werden
+			ELSE
+				//Den String bauen um das Senden der Messdaten zu starten und an den LaserScanner-Server senden
+				_http.cmd.message := Tc2_Standard.CONCAT('/cmd/start_scanoutput?handle=', _handle);
+				_http.cmd.senden := TRUE;
+				_state := FB_LaserScannerR2000_State.START_SCANOUTPUT_ANTWORT_ABWARTEN;
+			END_IF
+		ELSIF _http.status.error THEN
+			status.errorId := _http.status.errorId;
+			status.errorMeldung := 'Der http-Client meldet einen Fehler beim Auswerten der Antwort nach dem senden des Handle-Requests';
+			_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+		END_IF
+
+	
+		
+	FB_LaserScannerR2000_State.START_SCANOUTPUT_ANTWORT_ABWARTEN:
+		IF NOT _http.status.busy AND NOT _http.status.error THEN
+			antwortAuswerten(handleAuswerten := FALSE);
+			//Sollte der ErrorCode des Servers ungleich 0 sein dann meldet der LaserScanner einen Fehler
+			IF _serverAntwort.error_code > 0 OR _serverAntwort.error_code < 0 THEN
+				status.errorId := 0;
+				status.errorMeldung := Tc2_Standard.CONCAT('Nach dem Senden des Start-Befehls meldet der LaserScanner: ', _serverAntwort.error_text);
+				_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+			//Ansonsten ist alles korrekt verlaufen und es kann fortgefahren werden
+			ELSE
+				//Dem Nutzer anzeigen, dass die Verbindung zum Laserscanner besteht
+				status.laserScannerGestartet := TRUE;
+				//In den nächsten State springen um die Messdaten zu empfangen
+				_state := FB_LaserScannerR2000_State.AUF_MESSDATEN_WARTEN;
+			END_IF
+		ELSIF _http.status.error THEN
+			status.errorId := _http.status.errorId;
+			status.errorMeldung := 'Der http-Client meldet einen Fehler beim Auswerten der Antwort nach dem senden des Start-Befehls';
+			_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+		END_IF
+
+	
+		
+	FB_LaserScannerR2000_State.AUF_MESSDATEN_WARTEN:
+		status.busy := FALSE;
+		IF _udp.status.neueMessage THEN
+			_udp.cmd.messageAuslesen := TRUE;
+			status.neueMessdaten := TRUE;
+			_state := FB_LaserScannerR2000_State.MESSDATEN_AUSWERTEN;
+		END_IF
+			
+		
+		
+	FB_LaserScannerR2000_State.MESSDATEN_AUSWERTEN:
+		//Da nach dem Auswerten eines Messdatenpaketes wieder in diesen State gesprungen wird muss auch hier eine Stop-Funktion angeboten werden
+		IF cmd.stop THEN
+			status.neueMessdaten := FALSE;
+			status.busy := TRUE;
+			cmd.stop := FALSE;
+			_http.cmd.message := Tc2_Standard.CONCAT('/cmd/stop_scanoutput?handle=', _handle);
+			_http.cmd.senden := TRUE;
+			_state := FB_LaserScannerR2000_State.LASERSCANNER_STOPEN;
+		//Warten bis der UDP-Baustein nicht mehr beschäftigt ist
+		ELSIF NOT _udp.status.busy AND NOT _udp.status.error AND cmd.messdatenAuslesen THEN
+			status.neueMessdaten := FALSE;
+			status.busy := TRUE;
+			cmd.messdatenAuslesen := FALSE;
+			_udp.cmd.messageAuslesen := FALSE;
+			//Überprüfen, ob die erhaltene Message mit dem Startwert (magic-Bytes) beginnt um festzustellen, dass es der Beginn einer neuen Message ist
+			//Ansonsten Fehlermeldung ausgeben
+			IF ( WORD_TO_UINT(ByteDrehenWORD(0)) <> 16#A25C) THEN
+				status.errorMeldung := 'Eine ausgelesene Message des Laserscanners beginnt nicht mit den Start-Bytes';
+				_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+			ELSE
+				//Die Bytes des Headers auswerten (Der Header für Typ A Packete geht von Index 0 bis 63 siehe Schnittstellenbeschreibung S. 43)
+				_header.packet_type := WORD_TO_UINT(ByteDrehenWORD(2)); //41 für Typ A Packet
+				_header.packet_size := DWORD_TO_UDINT(ByteDrehenDWORD(4)); //Gesamtgröße des Packetes in Byte (Header + Payload)
+				_header.header_size := WORD_TO_UINT(ByteDrehenWORD(8)); //Größe des Headers in Byte
+				_header.scan_number := WORD_TO_UINT(ByteDrehenWORD(10)); //Die Nummer des aktuellen Scanns. Sie wird bei jedem neuen Scan um 1 erhöht. Overflows sind zu beachten!
+				_header.packet_number := WORD_TO_UINT(ByteDrehenWORD(12)); //Die Paketnummer des aktuellen Scans. Sie beginnt bei jedem neuen Scan bei 1. Sollten nicht alle Werte in ein Packet passen, werden weitere Packete gesendet und damit dieser Zähler erhöht
+				_header.status_flags := DWORD_TO_UDINT(ByteDrehenDWORD(30)); //Ist die Nummer ungleich 0 meldet der Laserscanner einen Fehler. Die Fehlernummer verweißt auf einen Fehler der auf Seite 41 der Schnittstellenbeschreibung zu finden ist
+				_header.scan_frequency := DWORD_TO_UDINT(ByteDrehenDWORD(34)); //Die ScanFrequenz --> Wert / 1000 = Frequenz in Hz
+				_header.num_points_scan := WORD_TO_UINT(ByteDrehenWORD(38)); //Anzahl der Scanpunkte inerhalb des gesammten Scans
+				_header.num_points_packet := WORD_TO_UINT(ByteDrehenWORD(40)); //Anzahl der Scannpunkte innerhalb dieses Packets
+				_header.first_index := WORD_TO_UINT(ByteDrehenWORD(42)); //Der Index des ersten Scanpunktes innerhalb dieses Packets
+				_header.first_angle := DWORD_TO_DINT(ByteDrehenDWORD(44)); //Der Absolute Winkel des ersten Scanpunktes dieses Packets --> Wert / 10 000 = Ergebnis in Grad
+				_header.angular_increment := DWORD_TO_DINT(ByteDrehenDWORD(48)); //Der Winkel zwischen zwei Messpunkten --> Wert / 10 000 = Ergebnis in Grad --> Positiver Winkel = CCW, Negativer Winkel = CW
+				_header.iq_input := DWORD_TO_UDINT(ByteDrehenDWORD(52)); //Unwichtig
+				_header.iq_overload := DWORD_TO_UDINT(ByteDrehenDWORD(56)); //Unwichtig
+				_header.header_padding := DWORD_TO_UDINT(ByteDrehenDWORD(60)); //Unwichtig
+				
+				//Das Statusflag des Laserscanners auswerten und dem Nutzer anzeigen
+				//Ist Bit 0 (LSB) oder 8 von status_flag 1 dann meldet der Laserscanner einen Status
+				IF _header.status_flags.0 OR _header.status_flags.8 THEN
+					status.laserscanerMeldungen := statusUntersuchen();
+				//Ist das 30. Bit == 1 liegt ein schwerer Fehler vor! :-/	
+				ELSIF _header.status_flags.30 THEN
+					status.errorId := 0;
+					status.errorMeldung := 'Der Laserscanner meldet: device_defect --> Der Laserscanner hat einen nicht behebbaren Fehler erkannt :-(';
+					_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+					RETURN;
+				ELSIF _header.status_flags.16 THEN
+					status.errorId := 0;
+					status.errorMeldung := Tc2_Standard.CONCAT('Der Laserscanner meldet: ', statusUntersuchen());
+					_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+					RETURN;	
+				ELSE
+					status.laserscanerMeldungen := '';
+				END_IF
+				
+				//Der LaserScanner arbeitet nicht mit Koordinaten von 0° bis 360°, sondern von 0° bis 179° und dann von -180° bis 0°, siehe Protokollbeschreibung S.27.
+				//Daher wird der Einfachheit halber eine Umrechnung vorgenommen um Koordinaten von 0° bis 360° zu erhalten
+				IF (_header.first_angle < 0) THEN
+					_firstAngle := 360.0 + (DINT_TO_REAL(_header.first_angle) / 10000.0);
+				ELSE
+					_firstAngle := DINT_TO_REAL(_header.first_angle) / 10000.0;
+				END_IF
+				
+				_n := 0;
+				//Alle Scanpunkte in diesem Paket auslesen
+				FOR _i := 0 TO (_header.num_points_packet) BY 1 DO
+					_distanzMessung := DWORD_TO_UDINT(ByteDrehenDWORD(_i * 4 + LETZTER_HEADER_INDEX));
+					//Überprüfen ob die gemessene Distanz im zu erfassenden Grenzbereich liegt
+					IF(_distanzMessung <= cmd.schwelle) THEN
+						//Liegt der Wert innerhalb des Grenzbereichs wird er in das MessdatenArray geschrieben
+						status.messdaten[_n].distanz := _distanzMessung;
+						
+						//Nun noch den Winkel des Messwerts errechnnen
+						_winkelPuffer := (((DINT_TO_REAL(_header.angular_increment) / 10000.0) * _i)  + _firstAngle);
+						IF _winkelPuffer < 0.0 THEN
+							status.messdaten[_n].winkel := _winkelPuffer + 360.0;
+						ELSIF _winkelPuffer > 360.0 THEN
+							status.messdaten[_n].winkel := _winkelPuffer - 360.0;
+						ELSE
+							status.messdaten[_n].winkel := _winkelPuffer;
+						END_IF
+						
+						//Den Index für das MessdatenArray inkrementieren
+						_n := _n + 1;
+					END_IF
+				END_FOR
+				//Die Anzahl der erfassten Messwerte dem Nutzer übergeben, damit er weis wie viele Messwerte er aus dem Array auslesen muss
+				status.anzahlMesswerte := _n;
+				//Busy-Status zurücksetzen
+				status.busy := FALSE;
+				//Wieder zurück in den State springen in dem auf neue Messdatenpakete geprüft wird
+				_state := FB_LaserScannerR2000_State.AUF_MESSDATEN_WARTEN;
+			END_IF
+		ELSIF _udp.status.error THEN
+			status.errorId := _udp.status.errorId;
+			status.errorMeldung := 'Beim Empfangen eines Messwertpackets meldet der UDP-Client einen Fehler';
+			_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+		END_IF
+			
+			
+			
+	FB_LaserScannerR2000_State.LASERSCANNER_STOPEN:
+		IF NOT _http.status.busy AND NOT _http.status.error THEN
+			antwortAuswerten(handleAuswerten := FALSE);
+			//Sollte der ErrorCode des Servers ungleich 0 sein dann meldet der LaserScanner einen Fehler
+			IF _serverAntwort.error_code > 0 OR _serverAntwort.error_code < 0 THEN
+				status.errorId := 0;
+				status.errorMeldung := Tc2_Standard.CONCAT('Nach dem Senden des Stop-Befehls meldet der LaserScanner: ', _serverAntwort.error_text);
+				_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+			//Ansonsten ist alles korrekt verlaufen und es kann fortgefahren werden
+			ELSE
+				//Dem Nutzer anzeigen, dass die Verbindung zum Laserscanner getrennt wurde
+				status.laserScannerGestartet := FALSE;
+				//Das bezogene Handle des LaserScanerServers wieder freigeben
+				_http.cmd.message := Tc2_Standard.CONCAT('/cmd/release_handle?handle=', _handle);
+				_http.cmd.senden := TRUE;
+				//Den Puffer des Laserscaners leeren
+				_udp.cmd.messagePufferLeeren := TRUE;
+				//Den message Zähler nullen
+				status.anzahlMesswerte := 0;
+				//Die Statusmeldungen des Laserscanners löschen
+				status.laserscanerMeldungen := ''; 
+				//In den nächsten State springen um die Antwort auszuwerten
+				_state := FB_LaserScannerR2000_State.HANDEL_FREIGEBEN;
+			END_IF
+		ELSIF _http.status.error THEN
+			status.errorId := _http.status.errorId;
+			status.errorMeldung := 'Der http-Client meldet einen Fehler beim Auswerten der Antwort nach dem senden des Stop-Befehls';
+			_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+		END_IF
+
+	
+		
+	FB_LaserScannerR2000_State.HANDEL_FREIGEBEN:
+		IF NOT _http.status.busy AND NOT _http.status.error THEN
+			antwortAuswerten(handleAuswerten := FALSE);
+			//Sollte der ErrorCode des Servers ungleich 0 sein dann meldet der LaserScanner einen Fehler
+			IF _serverAntwort.error_code > 0 OR _serverAntwort.error_code < 0 THEN
+				status.errorId := 0;
+				status.errorMeldung := Tc2_Standard.CONCAT('Nach dem Senden des Handelfreigabe-Befehls meldet der LaserScanner: ', _serverAntwort.error_text);
+				_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+			//Ansonsten ist alles korrekt verlaufen und es kann fortgefahren werden
+			ELSE
+				status.busy := FALSE;
+				//In den nächsten State springen um die Antwort auszuwerten
+				_state := FB_LaserScannerR2000_State.STAND_BY;
+			END_IF
+		ELSIF _http.status.error THEN
+			status.errorId := _http.status.errorId;
+			status.errorMeldung := 'Der http-Client meldet einen Fehler beim Auswerten der Antwort nach dem senden des Handelfreigabe-Befehls';
+			_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+		END_IF
+
+		
+	
+	FB_LaserScannerR2000_State.ERROR_HANDLER:
+		status.busy := FALSE;
+		status.error := TRUE;
+		status.neueMessdaten := FALSE;
+		status.laserScannerGestartet := FALSE;
+		_udp.cmd.messagePufferLeeren := TRUE;
+		IF cmd.reset THEN
+			cmd.reset := FALSE;
+			status.error := FALSE;
+			IF _http.status.error THEN
+				_http.cmd.reset := TRUE;
+			END_IF
+			IF _udp.status.error THEN
+				_udp.cmd.reset := TRUE;
+			END_IF
+			status.errorId := 0;
+			status.errorMeldung := '';
+			status.laserscanerMeldungen := '';
+			_udp.cmd.messagePufferLeeren := TRUE;
+			status.anzahlMesswerte := 0;
+			_state := FB_LaserScannerR2000_State.STAND_BY;
+		END_IF
+		
+END_CASE
+
+//Das Leeren des MessagePuffers ist jederzeit möglich!
+//Dadurch werden alle bis zu diesem Zeitpunkt noch nicht ausgewerteten Messdanten gelöscht
+IF cmd.messdatenVerwerfen THEN
+	cmd.messdatenVerwerfen := FALSE;
+	_udp.cmd.messagePufferLeeren := TRUE;
+END_IF
+
+
+
+//FB`s
+_http(
+	zielAdresse := ipLaserScanner,
+	zielPort := 80); //80 ist der Standart Port für http
+	
+_udp(
+	quellAdresse := ipMessdatenEmpfaenger,
+	quellPort := portMessdatenEmpfaenger,
+	messageAusgabeByte := TRUE);]]></ST>
+    </Implementation>
+    <Folder Name="_RequestMessage" Id="{664b868c-4134-49a4-8b47-e1d3dabcd7a9}" />
+    <Method Name="antwortAuswerten" Id="{5750a75b-a265-41e2-97df-f3c3f41972c2}">
+      <Declaration><![CDATA[METHOD PROTECTED antwortAuswerten 
+VAR_INPUT
+	//Enthält die Antwort einen Handle muss die Variable TRUE gesetzt werden
+	handleAuswerten : BOOL;
+END_VAR
+VAR
+	_buffer : STRING(255);
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[
+//Zuerst die Werte von _serverAntwort zurücksetzen
+_serverAntwort.error_code := -1;
+_serverAntwort.error_text := '';
+_serverAntwort.handle := '';
+
+
+//Dann die Antwort untersuchen
+//Zuerst die Antwort in den Buffer schreiben
+_buffer := _http.status.antwort;
+
+
+IF handleAuswerten THEN
+	//Den Handle den der LaserSacnner-Server vergeben hat erfassen
+	_serverAntwort.handle := stringZerlegen(pInputString := ADR(_buffer), lesenVon := '"handle":"', lesenBis := '",$R$N');
+END_IF
+
+//Den Status des "error_code" erfassen
+_serverAntwort.error_code := STRING_TO_DINT(stringZerlegen(pInputString := ADR(_buffer), lesenVon := '"error_code":', lesenBis := ',$R$N'));
+
+//Die Meldung des "error_text" erfassen wenn ein Fehler festgestellt wurde
+IF _serverAntwort.error_code > 0 THEN
+	_serverAntwort.error_text := stringZerlegen(pInputString := ADR(_buffer), lesenVon := '"error_text":', lesenBis := '."');
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="berechneAnzahlScannpunkte" Id="{de7632ac-532d-4ec4-9a09-1db475dd0a01}">
+      <Declaration><![CDATA[METHOD PROTECTED berechneAnzahlScannpunkte : UINT
+VAR_INPUT
+END_VAR
+VAR
+	_winkelDifferenz : INT;
+	_bufferMaxNumPointScan : REAL;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[
+//Da der Laser Scanner nicht die Möglichkeit bietet direkt einen Endwinkel angegeben zu bekommen und die nötigen berechnungen selbstständig durchzuführen,
+//muss die Berechnung manuel erfolgen. Auf diese Weise wird die Bedienbarkeit des FBs deutlich vereinfacht!
+
+
+
+//Die Winkeldifferenz zwischen Start und Endwinkel errechnen:
+
+//Drehrichtung CCW und StartWinkel ist kleiner als der EndWinkel
+IF _scanParameter.drehrichtungCCW AND _scanParameter.startwinkel < _scanParameter.endWinkel THEN
+	_winkelDifferenz := _scanParameter.endWinkel - _scanParameter.startwinkel;
+//Drehrichtung CCW und StartWinkel ist größer als der EndWinkel
+ELSIF _scanParameter.drehrichtungCCW AND _scanParameter.startwinkel > _scanParameter.endWinkel THEN
+	_winkelDifferenz := (360 - _scanParameter.startwinkel) + _scanParameter.endWinkel;
+//Drehrichtung CW und StartWinkel ist kleiner als der EndWinkel	
+ELSIF NOT _scanParameter.drehrichtungCCW AND _scanParameter.startwinkel < _scanParameter.endWinkel THEN
+	_winkelDifferenz := _scanParameter.startwinkel + (360 - _scanParameter.endWinkel);
+//Drehrichtung CW und StartWinkel ist größer als der EndWinkel		
+ELSIF NOT _scanParameter.drehrichtungCCW AND _scanParameter.startwinkel > _scanParameter.endWinkel THEN	
+	_winkelDifferenz := _scanParameter.startwinkel - _scanParameter.endWinkel;
+//Der einzigste Fall der übrig bleibt ist, dass StartWinkel und EndWinkel gleich groß sind
+ELSE
+	_winkelDifferenz := 0; 
+END_IF
+ 
+
+//Teilt man die Winkeldifferenz durch die Messauflösung erhält man die Anzahl der Scannpunkte die nötig sind um
+//vom Startwinkel ausgehend den Messbereich abzudecken.
+_bufferMaxNumPointScan := _winkelDifferenz / _scanParameter.messAufloesung;
+
+//Festlegen Ob die Errechnete Anzahl an Sampels auf- oder abgerundet werden soll
+IF  (_bufferMaxNumPointScan - REAL_TO_UINT(_bufferMaxNumPointScan)) >= 0.5 THEN
+	berechneAnzahlScannpunkte := REAL_TO_UINT(_bufferMaxNumPointScan) + 1;
+ELSE
+	berechneAnzahlScannpunkte := REAL_TO_UINT(_bufferMaxNumPointScan);
+END_IF
+RETURN;
+
+
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="ByteDrehenDWORD" Id="{9cd42bce-d623-4801-812d-8ae964da37cf}">
+      <Declaration><![CDATA[METHOD PROTECTED ByteDrehenDWORD : DWORD
+VAR_INPUT
+	//Der Index des ersten Bytes
+	startIndex : UINT;
+END_VAR
+
+VAR
+	uebergabe : POINTER TO BYTE;
+	puffer : DWORD;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[//Da die Bytes die über das Netzwerk gesendet wurden in Big Endian vorliegen, muss ihre Reihenfolge getauscht werden
+//Es wird dann ein DWORD ausgegeben, das dann in den gewünschten Typ gecastet werden kann
+
+//Pointer auf die Puffer-Variable zeigen lassen. Der Pointer zeigt somit auf das niederwertigste Byte des DWORDs
+uebergabe := ADR(puffer); 
+//Das Byte aus dem Array in den Puffer schreiben
+uebergabe^ := _udp.status.message[startIndex];
+//Den Pointer auf das nächste Byte des DWORDs zeigen lassen
+uebergabe := uebergabe + 1;
+// usw.....
+uebergabe^ := _udp.status.message[startIndex + 1];
+uebergabe := uebergabe + 1;
+uebergabe^ := _udp.status.message[startIndex + 2];
+uebergabe := uebergabe + 1;
+uebergabe^ := _udp.status.message[startIndex + 3];
+
+//Das ergebnis ausgeben
+ByteDrehenDWORD := puffer;
+RETURN;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="ByteDrehenWORD" Id="{97429d82-ee34-47b8-bb4b-02779d7d22aa}">
+      <Declaration><![CDATA[METHOD PROTECTED ByteDrehenWORD : WORD
+VAR_INPUT
+	//Der Index des ersten Bytes
+	startIndex : UINT;
+END_VAR
+
+VAR
+	uebergabe : POINTER TO BYTE;
+	puffer : WORD;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[//Da die Bytes die über das Netzwerk gesendet wurden in Big Endian vorliegen, muss ihre Reihenfolge getauscht werden
+//Es wird dann ein WORD ausgegeben, das dann in den gewünschten Typ gecastet werden kann
+
+//Pointer auf die Puffer-Variable zeigen lassen. Der Pointer zeigt somit auf das niederwertigste Byte des WORDs
+uebergabe := ADR(puffer); 
+//Das Byte aus dem Array in den Puffer schreiben
+uebergabe^ := _udp.status.message[startIndex];
+//Den Pointer auf das nächste Byte des WORDs zeigen lassen
+uebergabe := uebergabe + 1;
+// und mit dem nächsten Byte beschreiben
+uebergabe^ := _udp.status.message[startIndex + 1];
+
+//Das ergebnis ausgeben
+ByteDrehenWORD := puffer;
+RETURN;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="requestHandleMessage" Id="{7a6382be-089b-4bff-8c54-52087b207dfb}" FolderPath="_RequestMessage\">
+      <Declaration><![CDATA[METHOD PROTECTED requestHandleMessage : STRING(255)
+VAR_INPUT
+END_VAR
+VAR
+	_buffer : STRING(255);
+	_startWinkel : INT;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[
+//Der Fertige String sieht z.B. zum Schluss so aus:
+// --> /cmd/request_handle_udp?address=192.168.100.20&port=1020&watchdog=off&start_angle=450000&max_num_points_scan=100&packet_type=A
+
+
+
+//Den ersten Teil des Strings erstellen
+_buffer := '/cmd/request_handle_udp?address=';
+
+
+//IP-Adresse des Messdatenempfängers
+IF ipMessdatenEmpfaenger = '' THEN
+	status.errorId := 0;
+	status.errorMeldung := 'Für den Messdatenempfänger wurde keine IP-Adresse angegeben!';
+	_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+	RETURN;
+ELSE
+	_buffer := Tc2_Standard.CONCAT(_buffer, ipMessdatenEmpfaenger);
+END_IF
+
+
+//Port des Messdatenempfängers
+_buffer := Tc2_Standard.CONCAT(_buffer, '&port=');
+_buffer := Tc2_Standard.CONCAT(_buffer, UINT_TO_STRING(portMessdatenEmpfaenger));
+
+
+//Den Watchdog deaktivieren
+_buffer := Tc2_Standard.CONCAT(_buffer, '&watchdog=off&');
+
+
+
+//Die angegebenen Winkel auf Korrektheit prüfen
+IF _scanParameter.startwinkel > 360 OR  _scanParameter.startwinkel < 0 THEN
+	status.errorId := 0;
+	status.errorMeldung := 'Der eingegebene Startwinkel ist inkorrekt! Er muss zwischen 0° und 360° liegen';
+	_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+	RETURN;
+ELSIF _scanParameter.endWinkel > 360 OR  _scanParameter.endWinkel < 0 THEN
+	status.errorId := 0;
+	status.errorMeldung := 'Der eingegebene Endwinkel ist inkorrekt! Er muss zwischen 0° und 360° liegen';
+	_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+	RETURN;
+END_IF
+
+//Der LaserScanner arbeitet nicht mit Koordinaten von 0° bis 360°, sondern von 0° bis 179° und dann von -180° bis 0°, siehe Protokollbeschreibung S.27.
+//Daher muss die Nutzereingabe in das Koordinatensystem des Laserscaner umgerechnet werden.
+IF _scanParameter.startwinkel >= 180 THEN
+	_startWinkel := _scanParameter.startwinkel - 360;
+ELSE
+	_startWinkel := _scanParameter.startwinkel;
+END_IF
+
+
+//Startwinkel 
+_buffer := Tc2_Standard.CONCAT(_buffer, 'start_angle=');                                                                                                    
+//Die cmd-Eingabe muss noch mit 10000 multipliziert werden um den Wert in der geforderten Potenz zu übergeben  
+_buffer := Tc2_Standard.CONCAT(_buffer, INT_TO_STRING(_startWinkel*10000));
+
+
+//Die maximale Anzahl an Scannpunkten erfassen
+//Die Anzahl der Sampels berechnen und in den String einfügen
+_buffer := Tc2_Standard.CONCAT(_buffer, '&max_num_points_scan='); 
+_buffer := Tc2_Standard.CONCAT(_buffer, UINT_TO_STRING(berechneAnzahlScannpunkte())); 
+
+
+//Den geforderten Pakettyp angeben
+requestHandleMessage := Tc2_Standard.CONCAT(_buffer, '&packet_type=A');  
+
+
+
+_state := FB_LaserScannerR2000_State.HANDLE_REQUEST_ANTWORT_ABWARTEN;
+RETURN;
+	]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="SetParameterMessage" Id="{7c4013ef-0e4d-4d57-bb73-ae581e87a27d}" FolderPath="_RequestMessage\">
+      <Declaration><![CDATA[METHOD PROTECTED SetParameterMessage : STRING(255)
+VAR_INPUT
+END_VAR
+
+VAR
+	_buffer : STRING(255);
+	
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[
+//Den ersten Teil des Strings erstellen
+_buffer := '/cmd/set_parameter?';
+
+
+//Drehrichtung einstellen
+IF _scanParameter.drehrichtungCCW THEN
+	_buffer := Tc2_Standard.CONCAT(_buffer, 'scan_direction=ccw');
+ELSE
+	_buffer := Tc2_Standard.CONCAT(_buffer, 'scan_direction=cw');
+END_IF
+
+
+//Drehfrequenz einstellen
+IF _scanParameter.messFrequenz < 10 OR _scanParameter.messFrequenz > 50 THEN
+	status.errorId := 0;
+	status.errorMeldung := 'Die angegbene Messfrequenz ist ungültig! Sie muss zwischen 10Hz und 50Hz liegen!';
+	_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+	RETURN;
+ELSE
+	_buffer := Tc2_Standard.CONCAT(_buffer, '&scan_frequency=');
+	_buffer := Tc2_Standard.CONCAT(_buffer, UINT_TO_STRING(_scanParameter.messFrequenz));
+END_IF
+
+
+//Sampels per Scan einstellen (mittels messAuflsöung)
+IF _scanParameter.messAufloesung < 0.014 OR _scanParameter.messAufloesung > 360.0 THEN
+	status.errorId := 0;
+	status.errorMeldung := 'Die angegbene Messauflösung ist ungültig! Sie muss zwischen 0.014° und 360.0° liegen!';
+	_state := FB_LaserScannerR2000_State.ERROR_HANDLER;
+	RETURN;
+ELSE
+	_sampelsPerScanErgebnis:= REAL_TO_UINT(360.0 / _scanParameter.messAufloesung);
+	_buffer := Tc2_Standard.CONCAT(_buffer, '&samples_per_scan=');
+	SetParameterMessage := Tc2_Standard.CONCAT(_buffer, UINT_TO_STRING(_sampelsPerScanErgebnis));
+END_IF
+
+
+
+_state := FB_LaserScannerR2000_State.PARAMETER_ANTWORT_ABWARTEN;
+RETURN;
+	
+
+	]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="statusUntersuchen" Id="{d81fc5c6-e5fc-4ac6-b5e3-63bc366d7a9d}">
+      <Declaration><![CDATA[METHOD PROTECTED statusUntersuchen : String(255)
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[
+
+//Generic - Meldungen:
+IF _header.status_flags.1 THEN
+	statusUntersuchen := 'new_settings --> Während dem Scan wurden globale Parameter des Scaners verändert';
+ELSIF _header.status_flags.2 THEN
+	statusUntersuchen := 'invalid_data --> Die Validität der Scandaten dieses Paketes ist nicht garantiert';
+ELSIF _header.status_flags.3 THEN
+	statusUntersuchen := 'unstable_rotation --> Die Scanfrequenz für diese Messung war nicht die vorgegebene Frequenz';
+ELSIF _header.status_flags.4 THEN
+	statusUntersuchen := 'skipped_packets --> Es gehen Pakete verloren';
+	
+//Warning - Meldungen:
+ELSIF _header.status_flags.10 THEN
+	statusUntersuchen := 'low_temperature_warning --> WARNUNG! Die interne Temperatur ist zu gering';
+ELSIF _header.status_flags.11 THEN
+	statusUntersuchen := 'high_temperature_warning --> WARNUNG! Die interne Temperatur ist zu groß';
+ELSIF _header.status_flags.12 THEN
+	statusUntersuchen := 'device_overload --> WARNUNG! Die CPU des Sensors ist überfordert';
+
+//Error - Meldungen:
+ELSIF _header.status_flags.18 THEN
+	statusUntersuchen := 'low_temperature_error --> ERROR! Die interne Temperatur ist zu gering';
+ELSIF _header.status_flags.19 THEN
+	statusUntersuchen := 'high_temperature_error --> ERROR! Die interne Temperatur ist zu groß';
+ELSIF _header.status_flags.20 THEN
+	statusUntersuchen := 'device_overload --> ERROR! Die CPU des Sensors ist überfordert';
+END_IF
+
+
+
+
+
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="stringZerlegen" Id="{9237b9b2-4fda-4a59-acd6-df69ac22a161}">
+      <Declaration><![CDATA[METHOD PROTECTED stringZerlegen : STRING(255)
+VAR_INPUT
+	//laenge : UINT;
+	pInputString : POINTER TO STRING(255);
+	lesenVon : STRING(80);
+	lesenBis : STRING(80);
+END_VAR
+VAR
+	_vonPosition : INT;
+	_bisPosition : INT;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[//Diese Methode untersucht einen Übergebenen String nach einem Teilstring der zwischen 
+//lesenVon und lesenBis liegt. Dieser wird zurückgegeben. Der als inputString übergebene String wird abgeschnitten,
+//und zwar bis inkl. lesenBis!
+
+
+//Startposition ermitteln:
+_vonPosition := Tc2_Standard.FIND(STR1 := pInputString^, STR2 := lesenVon);
+_vonPosition := _vonPosition + (Tc2_Standard.LEN(lesenVon));
+
+//Endposition ermitteln:
+_bisPosition := Tc2_Standard.FIND(STR1 := pInputString^, STR2 := lesenBis);
+
+//Überprüfen ob ein Teilstring zwischen den Grenzen gefunden werden kann.
+//Falls nicht wird ein Leer-String zurückgegebn
+IF _vonPosition = _bisPosition OR _vonPosition > _bisPosition THEN
+	stringZerlegen := '';
+//Ansonsten gesuchten String auslesen:
+ELSE
+	stringZerlegen := Tc2_Standard.MID(STR := pInputString^, POS := _vonPosition, LEN := _bisPosition  - Tc2_Standard.LEN(lesenVon) - 1);
+END_IF
+
+//Den inputString kürzen:
+_bisPosition := _bisPosition + (Tc2_Standard.LEN(lesenBis) - 1);
+pInputString^ := Tc2_Standard.DELETE(STR := pInputString^, LEN := _bisPosition, POS := 0);
+RETURN;]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

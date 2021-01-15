@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4018.5">
+  <DUT Name="FB_LaserScannerR2000_Antwort" Id="{3d727c2a-c36f-4bc9-85b1-2d00c6e8e7da}">
+    <Declaration><![CDATA[TYPE FB_LaserScannerR2000_Antwort :
+STRUCT
+	handle : STRING(20);
+	error_code : DINT;
+	error_text : STRING(255);
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

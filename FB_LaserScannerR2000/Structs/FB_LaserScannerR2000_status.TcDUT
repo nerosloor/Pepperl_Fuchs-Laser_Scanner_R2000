@@ -1,0 +1,28 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4018.5">
+  <DUT Name="FB_LaserScannerR2000_status" Id="{af81af13-1191-46e2-b664-7449cb65c0c3}">
+    <Declaration><![CDATA[TYPE FB_LaserScannerR2000_status :
+STRUCT
+	//Wird TRUE wenn der Baustein arbeitet
+	busy : BOOL;
+	//Zeigt an ob eine Verbindung zum LaserScanner besteht oder ob mittels cmd.start eine neue Verbindung aufgebaut werden muss
+	laserScannerGestartet : BOOL;
+	//Es sind neue Messdaten vorhanden
+	neueMessdaten : BOOL;
+	//Array, dass die Messdaten beinhaltet
+	messdaten : ARRAY[0..999] OF FB_LaserScannerR2000_Messwert;
+	//Die Anzahl der zu übergebenden Messwerte
+	anzahlMesswerte : UINT;
+	//Status_Flag des Laserscanners. Siehe Beschreibung S.41
+	laserscanerMeldungen : STRING(255);
+	//Ein Fehler ist aufgetreten!
+	error : BOOL;
+	//ErrorID
+	errorId : UDINT;
+	//Error Meldung
+	errorMeldung : STRING(255);
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

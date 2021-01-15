@@ -1,0 +1,32 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4018.5">
+  <DUT Name="FB_LaserScannerR2000_State" Id="{510f3edf-b4b8-4165-9c6d-61091e873208}">
+    <Declaration><![CDATA[TYPE FB_LaserScannerR2000_State :
+(
+	UNDEFINIERT := 0,
+	STAND_BY,
+	UDP_PORT_OEFFNEN,
+	PARAMETER_ANTWORT_ABWARTEN,
+	HANDLE_REQUEST_ANTWORT_ABWARTEN,
+	START_SCANOUTPUT_ANTWORT_ABWARTEN,
+	AUF_MESSDATEN_WARTEN,
+	MESSDATEN_AUSWERTEN,
+	LASERSCANNER_STOPEN,
+	HANDEL_FREIGEBEN,
+	
+	
+	ERROR_HANDLER,
+	
+	
+	//Die States für die untergeordnete Statemachine um die Empfangenen Messages auszuwerten
+	START_WORD_PRUEFEN,
+	MESSAGE_ARRAY_BEFUELLEN,
+	
+	
+	
+	sdfsdfsdfasdf
+);
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>
