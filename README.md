@@ -8,17 +8,17 @@ Es werden lediglich Pakete des Typs A unterstützt!
 
 Hier die Struktur des FB:
 	
-						FB_LaserScannerR2000
-						|					          |
-						|					          |
-						|					          V
-						|				        FB_httpClient
-						|					          |
-						|					          |
-						V					          V	
-				FB_UdpConnection		FB_TcpClient
-						|				 	          |
-						|					          |
-						V					          V
-				Beckhoff FBs			  Beckhoff FBs
+					 FB_LaserScannerR2000
+					|		      |
+					|		      |
+					|		      V
+					|		FB_httpClient
+					|		      |
+					|		      |
+					V		      V	
+				FB_UdpConnection	FB_TcpClient
+					|		      |
+					|		      |
+					V		      V
+				Beckhoff FBs		  Beckhoff FBs
 				
